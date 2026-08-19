@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Sheaf
+GenericName=Document Scanner
+Comment=Scan documents and receipts on a Canon P-208II and send them to Paperless-ngx
+Exec=/home/njeske/projects/scanner/run.sh
+Icon=scanner
+Terminal=false
+Categories=Graphics;Scanning;GTK;
+Keywords=scan;scanner;receipt;paperless;document;sheaf;
+StartupNotify=true
+StartupWMClass=dev.njeske.Sheaf
