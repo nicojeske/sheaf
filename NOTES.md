@@ -324,3 +324,69 @@ code reads.
 named differently on that version, `parse_task()` in `upload/paperless.py` is the
 one place to change, and the app will otherwise report "Consumed by Paperless"
 without an id rather than failing.
+
+## 11. Colour mode fringes, and `--brightness`/`--contrast` do nothing
+
+Three findings from chasing a Color scan that looked oversaturated. None of them
+is fixable in the app, and none is in the brief.
+
+### `--brightness` and `--contrast` are accepted and then ignored
+
+The device reports both as active — `-127..127 (in steps of 1) [0]`, not
+`[inactive]` — and the backend really does build a lookup table from them. With
+`SANE_DEBUG_CANON_DR=25` the values arrive:
+
+```console
+$ SANE_DEBUG_CANON_DR=25 scanimage -d canon_dr:... --brightness -100 --contrast 127 ...
+[canon_dr] load_lut: start 0 0        # at sane_control_option time
+[canon_dr] load_lut: start 127 -100   # at sane_start, with the real values
+```
+
+The output does not change. Two 18 × 20 mm Color probes, identical except for
+brightness:
+
+| `--brightness` | min | max | distinct levels |
+|---|---|---|---|
+| −100 | 52 | 240 | 94 |
+| +100 | 50 | 240 | 91 |
+
+A 200-unit swing moves the histogram by two levels. The table is built and then
+not applied on this model in Color mode. `argv.py` emits both options correctly
+(and omits them at 0, which is the device default), so there is nothing to fix
+here — the controls are simply inert, and the sidebar's Enhancement group is
+honest only in the sense that it mirrors what the backend advertises.
+
+### Every channel hard-clips at 240
+
+Not 255, and not a scale: **zero** pixels at 239 in any channel, across fourteen
+scans from seven sessions. A blank white probe comes out uniformly `(240,240,240)`.
+Between 82% and 99% of each page sits exactly at the clamp.
+
+Harmless for paper, which should be white anyway, but everything lighter than the
+clip point is flattened onto the same value, so faint pencil, highlighter and pale
+tints are not recoverable afterwards. Worth knowing before reaching for an
+app-side levels control: there is nothing above 240 to pull down.
+
+### R and B are about one row apart — this is the "oversaturation"
+
+The visible complaint was not exposure at all. Every horizontal rule and text
+stroke carries a red edge on one side and a cyan edge on the other. Per-channel
+row profiles over a 1900 × 2100 region of text, cross-correlated:
+
+| pair | best shift | neighbours |
+|---|---|---|
+| R vs G | 0 rows | +1: 0.934, −1: 0.838 → R sits *late* |
+| B vs G | 0 rows | −1: 0.937, +1: 0.842 → B sits *early* |
+| **R vs B** | **+1 row** | +1: 0.976, 0: 0.954 |
+
+So the three sensor rows land roughly half a row either side of green — a one-pass
+CIS scanner's inter-line spacing, not fully compensated. On grey ink and white
+paper it puts chroma where there is physically none: 2.5% of pixels above chroma
+30, 99th percentile 107.
+
+Because the offset is *sub-pixel*, a whole-pixel channel shift cannot fix it;
+correcting it properly needs a half-row resample, and the offset would have to be
+measured per resolution. **Gray mode avoids it entirely** — one channel, no
+registration to get wrong — which is why all four built-in presets use Gray and
+why receipts never showed this. Color is worth it only for genuinely coloured
+originals, and the fringing is inherent even then.

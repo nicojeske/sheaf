@@ -136,6 +136,20 @@ freely.
   labelled "Sheet 3 (back)" accordingly.
 - **Threshold only applies in Lineart mode**; the control is disabled otherwise
   and the option is not sent.
+- **Brightness and contrast do nothing.** The backend advertises both as active
+  and even builds a lookup table from them, but the image does not change:
+  `--brightness -100` and `+100` produce histograms two levels apart. They are
+  still in the sidebar because they are still in `scanimage --help`; do not
+  expect them to work. See `NOTES.md` §11.
+- **Colour mode fringes.** The sensor's three rows land about half a row either
+  side of each other, so every text stroke gets a red edge on one side and a cyan
+  edge on the other — which reads as garish, oversaturated colour on what is
+  really grey ink on white paper. **Use Gray unless the original is genuinely
+  coloured**; all four presets do. The offset is sub-pixel, so it cannot be
+  corrected by shifting channels.
+- **Highlights clip at 240**, per channel, with nothing at 239. Paper comes out
+  a flat 240, which is fine, but anything paler than the clip point is flattened
+  and cannot be recovered afterwards.
 - There is no flatbed and no "ADF Back" source, and only six resolutions
   (100/150/200/240/300/400/600) — that is what the firmware reports.
 
