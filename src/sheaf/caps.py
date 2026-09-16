@@ -36,12 +36,27 @@ DROPOUT_VALUES: tuple[str, ...] = (
 GRID_MM = 1387 / 65536
 
 # Maxima expressed in grid units, which is how the firmware reports them
-# (max width 10208, max length 16800 — see NOTES.md).
+# (max width 10208, max length 47244 — see NOTES.md).
+#
+# The length maximum is firmware-dependent. Stock P-208II firmware reports
+# 16800 (355.554 mm); this device runs the patched firmware from NOTES.md §13,
+# which enables Long Document Mode and reports 47244 (999.869 mm). Both the
+# advertised ceiling and the runtime feed-length enforcement follow this flag,
+# so 47244 is genuinely scannable, not merely advertised.
 MAX_PAGE_WIDTH_UNITS = 10208
-MAX_PAGE_HEIGHT_UNITS = 16800
+MAX_PAGE_HEIGHT_UNITS = 47244
+STOCK_MAX_PAGE_HEIGHT_UNITS = 16800  # unpatched firmware, for reference
 
 MAX_PAGE_WIDTH_MM = MAX_PAGE_WIDTH_UNITS * GRID_MM   # 216.0415...
-MAX_PAGE_HEIGHT_MM = MAX_PAGE_HEIGHT_UNITS * GRID_MM  # 355.5542...
+MAX_PAGE_HEIGHT_MM = MAX_PAGE_HEIGHT_UNITS * GRID_MM  # 999.8692...
+
+# The strip the receipt presets scan. This is a *product* choice, not the
+# hardware ceiling: the scanner fills the whole requested window regardless of
+# how short the paper is, so scanning the full 1000 mm for every receipt would
+# be needlessly slow and large. 16800 units (355.554 mm, US legal) is the
+# length the receipt workflow was tuned against — see NOTES.md §8/§8d — and it
+# stayed put when Long Document Mode raised the ceiling to 47244.
+RECEIPT_STRIP_HEIGHT_MM = 16800 * GRID_MM  # 355.5542...
 
 # -x and -y are capped by the *current* page-width / page-height rather than by
 # a fixed maximum, so their ceiling is the page maximum above. This is why

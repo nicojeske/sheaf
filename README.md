@@ -128,10 +128,28 @@ freely.
 
 ### Limits worth knowing
 
-- **355.5 mm is a hard ceiling.** The `canon_dr` backend implements no long
-  document mode and no auto-length detection, so a receipt longer than 355 mm
-  cannot be scanned in one pass. Canon's Windows driver can; that is unreachable
-  on Linux.
+- **This scanner now does 1000 mm in a single pass — after a firmware patch.**
+  Stock P-208II firmware enforces a 355.5 mm ceiling in hardware: the
+  `canon_dr` backend implements no long document mode, and asking for a longer
+  window gets a firmware-level rejection (`ASC 0x26`, invalid field) past
+  roughly 370-375 mm. Reverse engineering Canon's own published firmware
+  (`NOTES.md` §13) found the single byte that gates it — and found that no host
+  command can write it, because the only code that does is unreachable. The fix
+  was to patch the *reader* instead: a 4-byte change making that flag always
+  read as enabled, flashed with Canon's own updater (the firmware carries no
+  signature). Verified on the device: `max length` went from 16800 (355.554 mm)
+  to 47244 (999.869 mm), and a 500 mm scan that previously failed now returns a
+  true 500 mm image. Stock SANE, no backend changes.
+- **On a stock, unpatched P-208II the 355.5 mm ceiling still applies**, and
+  pushing it does not fail cleanly: the first over-length scan silently returns
+  success with a truncated image while the receipt sits stuck in the transport,
+  and only the *next* attempt reports the jam. Flip-and-stitch (`NOTES.md` §12)
+  remains the path there — and on a patched device for anything over 1000 mm.
+- **The receipt presets still scan a 355.5 mm strip, deliberately.** The
+  scanner fills whatever window it is given regardless of how short the paper
+  is, so using the full 1000 mm for every receipt would just make routine scans
+  slower and larger. Raise **Page height** by hand for a genuinely long
+  document.
 - **ADF Duplex produces two images per sheet**, front then back. Pages are
   labelled "Sheet 3 (back)" accordingly.
 - **Threshold only applies in Lineart mode**; the control is disabled otherwise

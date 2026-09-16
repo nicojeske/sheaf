@@ -129,4 +129,11 @@ def test_receipt_presets_enable_the_options_naps2_cannot_reach():
     for preset in BUILTIN_PRESETS[:2]:
         assert preset.settings.swcrop
         assert preset.settings.swdeskew
-        assert preset.settings.page_height == pytest.approx(caps.MAX_PAGE_HEIGHT_MM)
+        # The receipt strip is deliberately the 355.554 mm legal length, not
+        # the hardware ceiling: Long Document Mode raised the maximum to
+        # 999.869 mm, but the scanner fills whatever window it is given, so
+        # receipts would otherwise pay for a 1 m pass. See caps.py.
+        assert preset.settings.page_height == pytest.approx(
+            caps.RECEIPT_STRIP_HEIGHT_MM
+        )
+        assert preset.settings.page_height < caps.MAX_PAGE_HEIGHT_MM

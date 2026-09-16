@@ -15,10 +15,21 @@ def test_grid_is_fixed_point_quantised_not_plain_1_1200_inch():
 
 
 def test_maxima_match_the_firmware_reported_units():
+    # Long Document Mode firmware (NOTES.md §13): the device reports
+    # "max width: 10208 (8.51 in) / max length: 47244 (39.37 in)".
     assert caps.MAX_PAGE_WIDTH_UNITS == 10208
-    assert caps.MAX_PAGE_HEIGHT_UNITS == 16800
+    assert caps.MAX_PAGE_HEIGHT_UNITS == 47244
     assert caps.MAX_PAGE_WIDTH_MM == pytest.approx(216.042, abs=0.001)
-    assert caps.MAX_PAGE_HEIGHT_MM == pytest.approx(355.554, abs=0.001)
+    assert caps.MAX_PAGE_HEIGHT_MM == pytest.approx(999.869, abs=0.001)
+
+
+def test_stock_firmware_height_is_recorded_for_reference():
+    # Unpatched firmware reports 16800 (355.554 mm); kept so the difference
+    # between stock and patched devices stays explicit.
+    assert caps.STOCK_MAX_PAGE_HEIGHT_UNITS == 16800
+    assert caps.STOCK_MAX_PAGE_HEIGHT_UNITS * caps.GRID_MM == pytest.approx(
+        355.554, abs=0.001
+    )
 
 
 @pytest.mark.parametrize("mm", [0.5, 12.3, 80.0, 210.0, 297.0, 355.5])
