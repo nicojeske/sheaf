@@ -85,6 +85,10 @@ class SheafWindow(Adw.ApplicationWindow):
         self._tmpdirs: list[Path] = []
         self._cards: dict[int, _Card] = {}
         self._retried_after_rediscovery = False
+        #: Pages from the scan run in progress, so every page of it can be
+        #: kept selected as more arrive — a fresh receipt is ready to send
+        #: the moment it finishes, with no need to click its card first.
+        self._current_run_pages: list[Page] = []
         #: Set once the user picks "Close anyway" over uploads still in
         #: flight, so the re-entrant close() this triggers does not ask again.
         self._force_close = False
@@ -485,6 +489,10 @@ class SheafWindow(Adw.ApplicationWindow):
             self._error_dialog("These settings cannot be scanned", str(exc))
             return
 
+        # A new run's pages should end up selected on their own, not merged
+        # into whatever was left selected (or not) from an earlier one.
+        self._current_run_pages = []
+
         job = ScanJob(
             self._device,
             settings,
@@ -520,6 +528,8 @@ class SheafWindow(Adw.ApplicationWindow):
             path, duplex=settings.is_duplex, dpi=settings.resolution
         )
         self._add_card(page)
+        self._current_run_pages.append(page)
+        self._select_run_pages()
         if settings.autocrop:
             self._request_crop(page, settings.autocrop_margin_mm)
         else:
@@ -527,6 +537,21 @@ class SheafWindow(Adw.ApplicationWindow):
         self._stack.set_visible_child_name("pages")
         self._progress.set_text(f"Scanned {len(self._pages)} page(s)…")
         self._update_actions()
+
+    def _select_run_pages(self) -> None:
+        """Re-select every page scanned so far in the current run.
+
+        ``_add_card`` unselects everything as a defensive measure against
+        GtkFlowBox auto-selecting its first child on focus (see its comment),
+        which would otherwise wipe out the earlier pages of a multi-page run
+        each time a new one arrives. Selecting the whole run again after each
+        arrival is what makes a duplex sheet, or any multi-page document,
+        land fully selected rather than just its last page.
+        """
+        for run_page in self._current_run_pages:
+            card = self._cards.get(id(run_page))
+            if card is not None:
+                self._flow.select_child(card.child)
 
     def _on_progress(self, fraction: float | None) -> None:
         if fraction is None:
@@ -853,10 +878,16 @@ class SheafWindow(Adw.ApplicationWindow):
         item = self._app.upload_queue.submit(name=_queue_item_label(pages), pages=pages)
         for page in item.origins:
             page.queued = True
-        self._flow.unselect_all()
-        self._update_actions()
+        self.clear_page_selection()
         active = self._app.upload_queue.counts().active
         self.toast(f"Queued — {active} upload(s) in progress")
+
+    def clear_page_selection(self) -> None:
+        """Deselect every card and refresh the buttons/count that depend on
+        selection. Called after any send, so a still-selected, now-queued
+        page cannot be resent by a follow-up click with nothing re-picked."""
+        self._flow.unselect_all()
+        self._update_actions()
 
     def _send_with_details(self) -> None:
         """The escape hatch: the old modal form, for the occasional document

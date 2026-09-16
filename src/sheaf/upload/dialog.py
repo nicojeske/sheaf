@@ -325,6 +325,9 @@ class SendToPaperlessDialog(Adw.Dialog):
         item = self._queue.submit(name=name, pages=self._pages, meta=meta)
         for page in item.origins:
             page.queued = True
+        # Otherwise these pages, still selected, would go right back out if
+        # the instant Send button were pressed again with nothing re-picked.
+        self._window.clear_page_selection()
         active = self._queue.counts().active
         self._window.toast(f"Queued — {active} upload(s) in progress")
         self.close()
