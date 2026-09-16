@@ -8,7 +8,7 @@ switched off.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .imaging import Box
@@ -30,6 +30,12 @@ class Page:
     crop: Box | None = None
     #: Lets the user see the page uncropped without losing the detected box.
     crop_enabled: bool = True
+    #: Submitted to the upload queue and not yet resolved. Kept on the page
+    #: (rather than only in the queue) so the empty-selection default in
+    #: PageStore.selection can skip it without the caller needing the queue.
+    queued: bool = False
+    #: The upload queue reported this page's document as consumed.
+    uploaded: bool = False
 
     @property
     def effective_crop(self) -> Box | None:
@@ -102,9 +108,32 @@ class PageStore:
     def clear(self) -> None:
         self.pages.clear()
 
-    def selection(self, selected: list[Page]) -> list[Page]:
-        """Selecting nothing means all pages, in current order."""
+    def unsent(self) -> list[Page]:
+        """Pages neither queued for upload nor already uploaded."""
+        return [p for p in self.pages if not p.queued and not p.uploaded]
+
+    def selection(
+        self, selected: list[Page], *, default: list[Page] | None = None
+    ) -> list[Page]:
+        """Selecting nothing falls back to ``default``, in current order.
+
+        ``default`` defaults to every page — the historical behaviour, still
+        right for "Save as PDF" and "Save as images". The upload path passes
+        ``unsent()`` instead, so an empty selection there does not re-send
+        documents already queued or uploaded.
+        """
         if not selected:
-            return list(self.pages)
+            return list(self.pages) if default is None else list(default)
         chosen = set(id(p) for p in selected)
         return [p for p in self.pages if id(p) in chosen]
+
+
+def snapshot(pages: list[Page]) -> tuple[Page, ...]:
+    """Detached copies, safe to hand to a background thread.
+
+    The scanned PNG on disk is never rewritten (see the module docstring), so
+    a copy of a Page's metadata is a genuine point-in-time snapshot: nothing
+    the user does afterwards — rotate, crop, delete, reorder — can change what
+    a worker thread renders from it.
+    """
+    return tuple(replace(p) for p in pages)

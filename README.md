@@ -201,16 +201,38 @@ available it falls back to `~/.config/scanner/token` with `0600` permissions, an
 the settings dialog says so rather than downgrading silently. The token is never
 written to `config.toml` and never logged.
 
-**Send to Paperless** collects a title, created date, correspondent, document
-type and tags (fetched from the server, all pages of each list), assembles the
-PDF, uploads it, and then **polls the consumption task** until the server reports
-success or failure. Paperless answers an upload with a task UUID, not a finished
-document — consumption happens afterwards and can still fail, most commonly
-because a rescanned receipt is rejected as a duplicate. You get the real result
-("Consumed as document #123") or the real reason for failure.
+**Send to Paperless** queues the selection as one document — nothing but the
+PDF, no title or tags — and returns immediately, so the next receipt can go
+straight into the feeder without waiting. Uploading and consumption happen in
+the background: the header bar grows an upload-queue button the moment
+anything is queued ("2 uploading", turning red on a failure), and its popover
+lists every document with its state. Send several receipts back to back and
+they upload and get consumed independently — nothing serialises on Paperless'
+own processing time.
 
-On failure the local PDF is kept (under `~/.cache/scanner/`) and the dialog
-offers **Try again**, so nothing is lost.
+Paperless answers an upload with a task UUID, not a finished document —
+consumption happens afterwards and can still fail, most commonly because a
+rescanned receipt is rejected as a duplicate. The popover shows the real
+result ("Consumed as document #123") or the real reason for failure, with a
+**Retry** that reuses the already-built PDF rather than exporting it again. A
+failure never stops the rest of the queue.
+
+Uploaded pages stay in the grid, dimmed and labelled with their document id,
+so a session's whole history is visible; **Clear uploaded pages** (in the
+Send button's menu) removes them once you're done. Selecting nothing sends
+every page not already queued or uploaded, so pressing Send again after a
+batch only picks up what's new.
+
+For the occasional document that needs a title, a date, a correspondent or
+tags set by hand, the Send button's menu also has **Send with details…** —
+the same form as before, still fetching tags/correspondents/document types
+from the server, but its upload now goes through the same background queue
+too, so it does not block the window either.
+
+On failure the local PDF is kept (under `~/.cache/scanner/`) until a retry
+succeeds, so nothing is lost. Closing the window while uploads are still in
+flight asks first — waiting lets them finish, since deleting the scan
+temp files under an export in progress would corrupt it.
 
 OCR is not performed locally — Paperless-ngx runs it server-side on consumption.
 
@@ -285,13 +307,16 @@ replugged and came back at a different USB address.
 ## Development
 
 ```sh
-.venv/bin/python -m pytest        # 99 tests, no GTK involved
+.venv/bin/python -m pytest        # 119 tests, no GTK involved
 ```
 
 The pure logic is deliberately free of any `gi` import so it can be tested:
 `argv.py` (option ordering), `geometry.py` (the fixed-point grid), `status.py`
-(exit codes), `imaging.py` (crop detection and padding) and
-`upload/paperless.py` (request building). There are no GTK integration tests.
+(exit codes), `imaging.py` (crop detection and padding), `export.py`
+(page assembly), `upload/paperless.py` (request building) and
+`upload/queue.py` (the background upload state machine, driven deterministically
+through its `tick()` method against a fake uploader and clock — no real
+threads or waiting in the test suite). There are no GTK integration tests.
 
 The split that keeps that possible is worth knowing when adding to the image
 side: `imaging.py` is pure Pillow, `thumbnails.py` is the GTK edge that runs it

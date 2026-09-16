@@ -14,6 +14,20 @@ class ExportError(RuntimeError):
     pass
 
 
+def document_dpi(pages: Sequence[Page]) -> int:
+    """The dpi a document made of ``pages`` should be laid out at.
+
+    All pages from one scan run share a resolution (``ScanSettings`` is
+    frozen for the duration of a job, see ``window._on_page_scanned``), so the
+    first page's is authoritative. Falls back to 300 for an empty sequence
+    rather than raising — callers that also validate ``pages`` non-empty (for
+    the actual export) get their own error message first.
+    """
+    for page in pages:
+        return page.dpi
+    return 300
+
+
 def export_pdf(pages: Sequence[Page], destination: Path, dpi: int) -> Path:
     """Assemble ``pages`` into a PDF at ``destination``.
 
@@ -28,7 +42,10 @@ def export_pdf(pages: Sequence[Page], destination: Path, dpi: int) -> Path:
         raise ExportError("There are no pages to save.")
 
     with tempfile.TemporaryDirectory(prefix="scanner-pdf-") as tmp:
-        sources = [_materialise(page, Path(tmp)) for page in pages]
+        sources = [
+            _materialise(page, Path(tmp), position)
+            for position, page in enumerate(pages, start=1)
+        ]
         layout = img2pdf.get_fixed_dpi_layout_fun((dpi, dpi))
         destination.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -61,11 +78,17 @@ def _needs_rendering(page: Page) -> bool:
     return bool(page.rotation) or page.effective_crop is not None
 
 
-def _materialise(page: Page, workdir: Path) -> Path:
-    """The file to hand to img2pdf: the original unless it needs transforming."""
+def _materialise(page: Page, workdir: Path, position: int) -> Path:
+    """The file to hand to img2pdf: the original unless it needs transforming.
+
+    Named by ``position`` (the page's slot in this export), not ``page.index``
+    (its slot in the scan run that produced it): a page removed earlier in the
+    session lets a later scan reuse its index, and two pages sharing a temp
+    filename in ``workdir`` means the second silently overwrites the first.
+    """
     if not _needs_rendering(page):
         return page.path
-    target = workdir / f"{page.index:04d}.png"
+    target = workdir / f"{position:04d}.png"
     _render_to(page, target)
     return target
 

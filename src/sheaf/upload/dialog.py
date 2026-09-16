@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import datetime
 import threading
-import time
-from pathlib import Path
+from collections.abc import Callable
 
 import gi
 
@@ -14,17 +13,14 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
-from ..config import Config, cache_dir  # noqa: E402
-from ..export import ExportError, export_pdf  # noqa: E402
+from ..config import Config  # noqa: E402
 from ..pages import Page  # noqa: E402
 from ..secrets import TokenStore  # noqa: E402
-from .base import ConnectionInfo, DocumentMeta, MetadataItem, TaskOutcome, UploadError  # noqa: E402
+from .base import ConnectionInfo, DocumentMeta, MetadataItem, UploadError  # noqa: E402
 from .paperless import PaperlessUploader  # noqa: E402
+from .queue import UploadQueue  # noqa: E402
 
 NONE_LABEL = "— none —"
-#: Consumption is queued server-side, so polling has to be patient but bounded.
-POLL_DELAYS = (1.0, 1.0, 2.0, 2.0, 3.0, 5.0)
-POLL_TIMEOUT = 180.0
 
 
 def make_uploader(config: Config, store: TokenStore | None = None) -> PaperlessUploader:
@@ -39,10 +35,16 @@ class PaperlessSettingsDialog(Adw.Dialog):
 
     __gtype_name__ = "PaperlessSettingsDialog"
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self, config: Config, *, on_saved: Callable[[], None] | None = None
+    ) -> None:
         super().__init__(title="Paperless settings", content_width=560, content_height=520)
         self._config = config
         self._store = TokenStore()
+        #: Called after a successful save, so the app can rebuild its shared
+        #: uploader — a new URL or token means its metadata cache
+        #: (paperless.py's PaperlessUploader._cache) is for the wrong server.
+        self._on_saved = on_saved
 
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
@@ -123,26 +125,47 @@ class PaperlessSettingsDialog(Adw.Dialog):
         except OSError as exc:
             self._test_row.set_subtitle(f"Could not save the configuration: {exc}")
             return
+        if self._on_saved is not None:
+            self._on_saved()
         self.close()
 
 
 class SendToPaperlessDialog(Adw.Dialog):
-    """Collects metadata, then assembles, uploads and polls."""
+    """Collects metadata, then hands the document to the upload queue.
+
+    Sending used to mean this dialog assembled the PDF, POSTed it and polled
+    Paperless' consumption task itself — up to 180 s with the window modal
+    the whole time. Now it only builds a DocumentMeta and submits: the queue
+    (owned by the app, see upload/queue.py) does the rest in the background,
+    so Send closes the dialog immediately and status lives in the window's
+    upload queue popover instead of here.
+    """
 
     __gtype_name__ = "SendToPaperlessDialog"
 
-    def __init__(self, window, config: Config, pages: list[Page]) -> None:
+    def __init__(
+        self,
+        window,
+        config: Config,
+        pages: list[Page],
+        uploader: PaperlessUploader,
+        queue: UploadQueue,
+    ) -> None:
         super().__init__(title="Send to Paperless", content_width=580, content_height=680)
         self._window = window
         self._config = config
-        self._pages = pages
-        self._store = TokenStore()
-        self._uploader = make_uploader(config, self._store)
+        # Held live, not snapshotted: Adw.Dialog is modal, so the main window
+        # cannot mutate these pages while this dialog is open, and the queue
+        # takes its own detached copy at the moment Send is actually pressed.
+        self._pages = list(pages)
+        #: Shared with the app rather than built fresh per dialog, so its
+        #: tag/correspondent/document-type cache survives between opens.
+        self._uploader = uploader
+        self._queue = queue
         self._tags: list[MetadataItem] = []
         self._correspondents: list[MetadataItem] = []
         self._document_types: list[MetadataItem] = []
         self._tag_switches: dict[int, Adw.SwitchRow] = {}
-        self._pdf_path: Path | None = None
 
         toolbar = Adw.ToolbarView()
         self._header = Adw.HeaderBar()
@@ -152,7 +175,7 @@ class SendToPaperlessDialog(Adw.Dialog):
         self.set_child(toolbar)
 
         self._stack.add_named(self._build_form(), "form")
-        self._stack.add_named(self._build_status(), "status")
+        self._stack.add_named(self._build_not_configured(), "not-configured")
         self._stack.set_visible_child_name("form")
 
         self._send_button = Gtk.Button(label="Send")
@@ -161,13 +184,16 @@ class SendToPaperlessDialog(Adw.Dialog):
         self._header.pack_end(self._send_button)
 
         if not config.paperless.configured:
-            self._show_status(
-                "Paperless is not configured",
-                "Add the server URL and API token in Paperless settings first.",
-            )
+            self._stack.set_visible_child_name("not-configured")
             self._send_button.set_sensitive(False)
         else:
             self._load_metadata()
+
+    def _build_not_configured(self) -> Gtk.Widget:
+        return Adw.StatusPage(
+            title="Paperless is not configured",
+            description="Add the server URL and API token in Paperless settings first.",
+        )
 
     # -- form -------------------------------------------------------------
     def _build_form(self) -> Gtk.Widget:
@@ -216,33 +242,6 @@ class SendToPaperlessDialog(Adw.Dialog):
         )
         page.add(pages_group)
         return page
-
-    def _build_status(self) -> Gtk.Widget:
-        self._status_page = Adw.StatusPage(title="", description="")
-        box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=12, halign=Gtk.Align.CENTER
-        )
-        self._spinner = Adw.Spinner(width_request=32, height_request=32)
-        box.append(self._spinner)
-        self._retry_button = Gtk.Button(label="Try again", visible=False)
-        self._retry_button.add_css_class("suggested-action")
-        self._retry_button.connect("clicked", lambda *_: self._back_to_form())
-        box.append(self._retry_button)
-        self._status_page.set_child(box)
-        return self._status_page
-
-    def _show_status(
-        self, title: str, description: str, *, busy: bool = False, retry: bool = False
-    ) -> None:
-        self._status_page.set_title(title)
-        self._status_page.set_description(description)
-        self._spinner.set_visible(busy)
-        self._retry_button.set_visible(retry)
-        self._stack.set_visible_child_name("status")
-
-    def _back_to_form(self) -> None:
-        self._stack.set_visible_child_name("form")
-        self._send_button.set_sensitive(True)
 
     # -- metadata ---------------------------------------------------------
     def _load_metadata(self, *, refresh: bool = False) -> None:
@@ -317,84 +316,18 @@ class SendToPaperlessDialog(Adw.Dialog):
         self._config.paperless.default_tags = list(meta.tags)
         self._config.paperless.default_correspondent = meta.correspondent
         self._config.paperless.default_document_type = meta.document_type
-
-        self._send_button.set_sensitive(False)
-        self._show_status("Preparing the PDF…", "", busy=True)
-
-        threading.Thread(
-            target=self._upload_worker, args=(meta,), name="paperless-upload", daemon=True
-        ).start()
-
-    def _upload_worker(self, meta: DocumentMeta) -> None:
-        dpi = self._config.settings.resolution
-        target = cache_dir() / f"{_safe_stem(meta.title)}-{int(time.time())}.pdf"
-        try:
-            export_pdf(self._pages, target, dpi)
-        except ExportError as exc:
-            GLib.idle_add(self._failed, "Could not build the PDF", str(exc))
-            return
-        self._pdf_path = target
-
-        GLib.idle_add(self._progress, "Uploading…", target.name)
-        try:
-            task_id = self._uploader.upload(target, meta)
-        except UploadError as exc:
-            GLib.idle_add(self._failed, "Upload failed", f"{exc}\n\nThe PDF is kept at {target}")
-            return
-
-        GLib.idle_add(self._progress, "Waiting for Paperless to consume it…", "")
-        deadline = time.monotonic() + POLL_TIMEOUT
-        for index in range(10_000):
-            time.sleep(POLL_DELAYS[min(index, len(POLL_DELAYS) - 1)])
-            try:
-                state = self._uploader.poll(task_id)
-            except UploadError as exc:
-                GLib.idle_add(
-                    self._failed,
-                    "Could not check the upload",
-                    f"{exc}\n\nThe PDF is kept at {target}",
-                )
-                return
-            if state.outcome is TaskOutcome.SUCCESS:
-                GLib.idle_add(self._succeeded, state.document_id, target)
-                return
-            if state.outcome is TaskOutcome.FAILURE:
-                GLib.idle_add(
-                    self._failed,
-                    "Paperless rejected the document",
-                    f"{state.message}\n\nThe PDF is kept at {target}",
-                )
-                return
-            if time.monotonic() > deadline:
-                GLib.idle_add(
-                    self._failed,
-                    "Paperless is still processing",
-                    "The upload was accepted but consumption has not finished. "
-                    f"Check the server.\n\nThe PDF is kept at {target}",
-                )
-                return
-
-    def _progress(self, title: str, detail: str) -> bool:
-        self._show_status(title, detail, busy=True)
-        return False
-
-    def _failed(self, title: str, detail: str) -> bool:
-        self._show_status(title, detail, retry=True)
-        return False
-
-    def _succeeded(self, document_id: int | None, pdf: Path) -> bool:
-        if document_id is not None:
-            message = f"Consumed as document #{document_id}"
-        else:
-            message = "Consumed by Paperless"
-        pdf.unlink(missing_ok=True)
         try:
             self._config.save()
         except OSError:
             pass
-        self._window.toast(message)
+
+        name = meta.title or f"{len(self._pages)} page(s)"
+        item = self._queue.submit(name=name, pages=self._pages, meta=meta)
+        for page in item.origins:
+            page.queued = True
+        active = self._queue.counts().active
+        self._window.toast(f"Queued — {active} upload(s) in progress")
         self.close()
-        return False
 
 
 def _fill_combo(row: Adw.ComboRow, items: list[MetadataItem], selected: int | None) -> None:
@@ -420,10 +353,3 @@ def _parse_date(text: str) -> datetime.date | None:
         return datetime.date.fromisoformat(text.strip())
     except ValueError:
         return None
-
-
-def _safe_stem(title: str | None) -> str:
-    if not title:
-        return "document"
-    keep = [c if c.isalnum() or c in "-_" else "-" for c in title]
-    return "".join(keep).strip("-") or "document"

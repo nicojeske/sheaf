@@ -15,7 +15,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from . import caps, imaging, thumbnails  # noqa: E402
 from .config import Config  # noqa: E402
@@ -25,7 +25,7 @@ from .device import (  # noqa: E402
     find_device,
     reset_usb_device,
 )
-from .export import ExportError, export_images, export_pdf  # noqa: E402
+from .export import ExportError, document_dpi, export_images, export_pdf  # noqa: E402
 from .geometry import GeometryError  # noqa: E402
 from .pages import Page, PageStore  # noqa: E402
 from .presets import Preset  # noqa: E402
@@ -34,10 +34,23 @@ from .scan import ScanJob  # noqa: E402
 from .settings import ScanSettings  # noqa: E402
 from .sidebar import SettingsSidebar  # noqa: E402
 from .status import Outcome, ScanResult  # noqa: E402
+from .upload.queue import UploadState  # noqa: E402
 
 TOAST_TIMEOUT = 6
 #: A USB port needs a moment to come back after a reset before it can be opened.
 RESET_SETTLE = 3.0
+#: Card status caption for every non-terminal upload state. DONE and FAILED
+#: are worded specially (with the document id, or "failed"), so they are not
+#: here.
+_CARD_STATUS_TEXT = {
+    UploadState.QUEUED: "Waiting to upload…",
+    UploadState.EXPORTING: "Building the PDF…",
+    UploadState.UPLOADING: "Uploading…",
+    UploadState.CONSUMING: "Paperless is consuming…",
+}
+#: How much a card dims once its document has been consumed — enough to read
+#: as "already filed" across a grid of thirty cards, not so much it vanishes.
+_UPLOADED_CARD_OPACITY = 0.55
 
 
 @dataclass(slots=True)
@@ -52,6 +65,9 @@ class _Card:
     holder: Gtk.Stack
     picture: Gtk.Picture
     detail: Gtk.Label
+    #: Upload queue state — "Uploading…", "Uploaded #123", "Upload failed".
+    #: A separate line from ``detail``, which holds the page's size in mm.
+    status: Gtk.Label
 
 
 class SheafWindow(Adw.ApplicationWindow):
@@ -59,6 +75,9 @@ class SheafWindow(Adw.ApplicationWindow):
 
     def __init__(self, application: Adw.Application, config: Config) -> None:
         super().__init__(application=application, title="Sheaf")
+        #: The app, not just Adw.Application — it owns the shared uploader
+        #: and the upload queue, both of which outlive any one window.
+        self._app = application
         self._config = config
         self._pages = PageStore()
         self._job: ScanJob | None = None
@@ -66,6 +85,12 @@ class SheafWindow(Adw.ApplicationWindow):
         self._tmpdirs: list[Path] = []
         self._cards: dict[int, _Card] = {}
         self._retried_after_rediscovery = False
+        #: Set once the user picks "Close anyway" over uploads still in
+        #: flight, so the re-entrant close() this triggers does not ask again.
+        self._force_close = False
+        #: Set when the user picks "Wait" instead — toast once the queue
+        #: that was blocking the close actually empties.
+        self._toast_when_queue_empties = False
 
         self.set_default_size(config.window.width, config.window.height)
         if config.window.maximized:
@@ -92,6 +117,7 @@ class SheafWindow(Adw.ApplicationWindow):
             preset.settings if preset else config.settings, keep_preset=preset is not None
         )
         self._on_settings_changed()
+        self._install_window_actions()
 
         self.connect("close-request", self._on_close)
         self.refresh_device()
@@ -117,11 +143,73 @@ class SheafWindow(Adw.ApplicationWindow):
 
         menu = _build_menu()
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
+        header.pack_end(self._build_queue_button())
         toolbar.add_top_bar(header)
 
         toolbar.set_content(self._build_page_area())
         toolbar.add_bottom_bar(self._build_action_bar())
         return toolbar
+
+    def _build_queue_button(self) -> Gtk.MenuButton:
+        """The upload queue's status indicator and its popover.
+
+        Doubles as both: the button itself is the always-visible glance ("2
+        uploading", turning red on a failure) that someone feeding paper
+        needs, and its popover is where the detail lives. Hidden until the
+        queue has ever held an item, so it costs nothing when Paperless is
+        not in use.
+        """
+        self._queue_icon = Gtk.Image(icon_name="cloud-upload-symbolic")
+        self._queue_spinner = Adw.Spinner(width_request=16, height_request=16)
+        self._queue_status_stack = Gtk.Stack()
+        self._queue_status_stack.add_named(self._queue_icon, "icon")
+        self._queue_status_stack.add_named(self._queue_spinner, "spinner")
+
+        self._queue_count_label = Gtk.Label()
+
+        content = Gtk.Box(spacing=4)
+        content.append(self._queue_status_stack)
+        content.append(self._queue_count_label)
+
+        self._queue_button = Gtk.MenuButton(child=content, visible=False)
+        self._queue_button.set_tooltip_text("Upload queue")
+
+        self._queue_listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self._queue_listbox.add_css_class("boxed-list")
+        self._queue_rows: dict[int, Adw.ActionRow] = {}
+        self._queue_empty_row = Adw.ActionRow(title="Nothing queued")
+        self._queue_empty_row.add_css_class("dim-label")
+        self._queue_listbox.append(self._queue_empty_row)
+
+        scroller = Gtk.ScrolledWindow(
+            child=self._queue_listbox,
+            min_content_width=320,
+            max_content_height=360,
+            propagate_natural_height=True,
+        )
+
+        self._queue_retry_all_button = Gtk.Button(label="Retry all", visible=False)
+        self._queue_retry_all_button.connect("clicked", lambda *_: self._retry_all_failed())
+        clear_button = Gtk.Button(label="Clear finished")
+        clear_button.connect("clicked", lambda *_: self._clear_finished_queue())
+        footer = Gtk.Box(spacing=6, halign=Gtk.Align.END, margin_top=6)
+        footer.append(self._queue_retry_all_button)
+        footer.append(clear_button)
+
+        popover_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=6,
+            margin_top=6,
+            margin_bottom=6,
+            margin_start=6,
+            margin_end=6,
+        )
+        popover_box.append(scroller)
+        popover_box.append(footer)
+
+        popover = Gtk.Popover(child=popover_box)
+        self._queue_button.set_popover(popover)
+        return self._queue_button
 
     def _build_page_area(self) -> Gtk.Widget:
         self._stack = Gtk.Stack(vexpand=True)
@@ -203,8 +291,13 @@ class SheafWindow(Adw.ApplicationWindow):
         self._images_button.connect("clicked", lambda *_: self._save_images())
         actions.append(self._images_button)
 
-        self._paperless_button = Gtk.Button(label="Send to Paperless")
+        self._paperless_button = Adw.SplitButton(label="Send to Paperless")
         self._paperless_button.connect("clicked", lambda *_: self._send_to_paperless())
+        paperless_menu = Gio.Menu()
+        paperless_menu.append("Send with details…", "win.send-with-details")
+        paperless_menu.append("Show upload queue", "win.show-upload-queue")
+        paperless_menu.append("Clear uploaded pages", "win.clear-uploaded-pages")
+        self._paperless_button.set_menu_model(paperless_menu)
         actions.append(self._paperless_button)
 
         box.append(actions)
@@ -533,6 +626,10 @@ class SheafWindow(Adw.ApplicationWindow):
         detail.add_css_class("dim-label")
         card.append(detail)
 
+        status = Gtk.Label(visible=False)
+        status.add_css_class("caption")
+        card.append(status)
+
         buttons = Gtk.Box(spacing=2, halign=Gtk.Align.CENTER, margin_bottom=6)
         for icon, tooltip, callback in (
             ("go-previous-symbolic", "Move earlier", lambda: self._move_page(page, -1)),
@@ -549,7 +646,7 @@ class SheafWindow(Adw.ApplicationWindow):
 
         child = Gtk.FlowBoxChild(child=card)
         self._cards[id(page)] = _Card(
-            child=child, holder=holder, picture=picture, detail=detail
+            child=child, holder=holder, picture=picture, detail=detail, status=status
         )
         self._flow.append(child)
         # GtkFlowBox selects the first child when it takes focus, which would
@@ -641,13 +738,16 @@ class SheafWindow(Adw.ApplicationWindow):
 
     # -- selection and actions -------------------------------------------
     def selected_pages(self) -> list[Page]:
+        """Selecting nothing means "every page not already queued or
+        uploaded" — the right default now that a sent document's pages stay
+        in the grid rather than disappearing (see PageStore.unsent)."""
         chosen: list[Page] = []
         for child in self._flow.get_selected_children():
             for page in self._pages:
                 card = self._cards.get(id(page))
                 if card is not None and card.child is child:
                     chosen.append(page)
-        return self._pages.selection(chosen)
+        return self._pages.selection(chosen, default=self._pages.unsent())
 
     def _update_actions(self) -> None:
         scanning = self._job is not None
@@ -658,10 +758,16 @@ class SheafWindow(Adw.ApplicationWindow):
 
         total = len(self._pages)
         selected = len(self._flow.get_selected_children())
+        uploaded = sum(1 for page in self._pages if page.uploaded)
         if not total:
             self._page_count.set_text("")
         elif selected:
             self._page_count.set_text(f"{selected} of {total} pages selected")
+        elif uploaded:
+            self._page_count.set_text(
+                f"{total} page(s) — {total - uploaded} will be sent "
+                f"({uploaded} already uploaded)"
+            )
         else:
             self._page_count.set_text(f"{total} page(s) — all will be saved")
 
@@ -685,7 +791,7 @@ class SheafWindow(Adw.ApplicationWindow):
             path = Path(file.get_path())
             self._remember_folder(path.parent)
             try:
-                export_pdf(pages, path, self._current_settings().resolution)
+                export_pdf(pages, path, document_dpi(pages))
             except ExportError as exc:
                 self._error_dialog("Could not save the PDF", str(exc))
                 return
@@ -719,8 +825,6 @@ class SheafWindow(Adw.ApplicationWindow):
         dialog.select_folder(self, None, done)
 
     def _initial_folder(self):
-        from gi.repository import Gio
-
         if self._config.last_save_dir and Path(self._config.last_save_dir).is_dir():
             return Gio.File.new_for_path(self._config.last_save_dir)
         return None
@@ -729,18 +833,225 @@ class SheafWindow(Adw.ApplicationWindow):
         self._config.last_save_dir = str(directory)
 
     # -- paperless --------------------------------------------------------
+    def _install_window_actions(self) -> None:
+        for name, callback in (
+            ("send-with-details", lambda *_: self._send_with_details()),
+            ("show-upload-queue", lambda *_: self._show_upload_queue()),
+            ("clear-uploaded-pages", lambda *_: self._clear_uploaded_pages()),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", callback)
+            self.add_action(action)
+
     def _send_to_paperless(self) -> None:
+        """The primary action: queue the selection as one document and return
+        immediately. This is the whole point of the queue — no dialog, no
+        wait, so the next receipt can go straight into the feeder."""
+        pages = self.selected_pages()
+        if not pages:
+            return
+        item = self._app.upload_queue.submit(name=_queue_item_label(pages), pages=pages)
+        for page in item.origins:
+            page.queued = True
+        self._flow.unselect_all()
+        self._update_actions()
+        active = self._app.upload_queue.counts().active
+        self.toast(f"Queued — {active} upload(s) in progress")
+
+    def _send_with_details(self) -> None:
+        """The escape hatch: the old modal form, for the occasional document
+        that needs a title, a date, or tags set by hand. Its upload now goes
+        through the queue too (see upload/dialog.py's _send), so it no longer
+        blocks the window either."""
         from .upload.dialog import SendToPaperlessDialog
 
         pages = self.selected_pages()
         if not pages:
             return
-        SendToPaperlessDialog(self, self._config, pages).present(self)
+        SendToPaperlessDialog(
+            self, self._config, pages, self._app.uploader(), self._app.upload_queue
+        ).present(self)
+
+    def _show_upload_queue(self) -> None:
+        self._queue_button.set_active(True)
+
+    def _clear_uploaded_pages(self) -> None:
+        uploaded = [page for page in self._pages if page.uploaded]
+        if not uploaded:
+            self.toast("Nothing to clear — no pages have been uploaded yet")
+            return
+        for page in uploaded:
+            self._delete_page(page)
+        self.toast(f"Cleared {len(uploaded)} uploaded page(s)")
 
     def open_paperless_settings(self) -> None:
         from .upload.dialog import PaperlessSettingsDialog
 
-        PaperlessSettingsDialog(self._config).present(self)
+        PaperlessSettingsDialog(
+            self._config, on_saved=self._app.invalidate_uploader
+        ).present(self)
+
+    # -- upload queue -------------------------------------------------------
+    def on_queue_item_changed(self, item) -> None:
+        """Called by the app (already marshalled onto the main loop) on every
+        upload queue state change."""
+        self._apply_item_flags(item)
+        self._apply_card_status(item)
+        self._sync_queue_ui()
+
+        if self._toast_when_queue_empties and self._app.upload_queue.counts().active == 0:
+            self._toast_when_queue_empties = False
+            self.toast("All uploads finished — the window can be closed now")
+
+    def _apply_item_flags(self, item) -> None:
+        queued = item.state not in (UploadState.DONE, UploadState.FAILED)
+        uploaded = item.state is UploadState.DONE
+        for page in item.origins:
+            page.queued = queued
+            page.uploaded = uploaded
+        self._update_actions()
+
+    def _apply_card_status(self, item) -> None:
+        """Reflect one upload item's state on every card it came from.
+
+        Keyed through ``item.origins`` — the live Page objects, not the
+        detached snapshot the worker actually renders — so this still finds
+        the right cards no matter what the worker is doing with its copies.
+        """
+        for page in item.origins:
+            card = self._cards.get(id(page))
+            if card is None:
+                continue
+            card.status.remove_css_class("success")
+            card.status.remove_css_class("error")
+            card.status.remove_css_class("dim-label")
+            card.status.set_visible(True)
+            if item.state is UploadState.DONE:
+                text = (
+                    f"Uploaded #{item.document_id}"
+                    if item.document_id is not None
+                    else "Uploaded"
+                )
+                card.status.set_label(text)
+                card.status.add_css_class("success")
+                card.child.set_opacity(_UPLOADED_CARD_OPACITY)
+            elif item.state is UploadState.FAILED:
+                card.status.set_label("Upload failed")
+                card.status.add_css_class("error")
+                card.child.set_opacity(1.0)
+            else:
+                card.status.set_label(_CARD_STATUS_TEXT.get(item.state, ""))
+                card.status.add_css_class("dim-label")
+                card.child.set_opacity(1.0)
+
+    def _sync_queue_ui(self) -> None:
+        items = self._app.upload_queue.items()
+        for row in list(self._queue_rows.values()):
+            self._queue_listbox.remove(row)
+        self._queue_rows.clear()
+
+        if not items:
+            if self._queue_empty_row.get_parent() is None:
+                self._queue_listbox.append(self._queue_empty_row)
+        else:
+            if self._queue_empty_row.get_parent() is not None:
+                self._queue_listbox.remove(self._queue_empty_row)
+            for item in items:
+                row = self._build_queue_row(item)
+                self._queue_rows[item.id] = row
+                self._queue_listbox.append(row)
+
+        self._refresh_queue_header(items)
+
+    def _build_queue_row(self, item) -> Adw.ActionRow:
+        row = Adw.ActionRow(title=item.name)
+        if item.state is UploadState.QUEUED:
+            row.set_subtitle("Waiting")
+        elif item.state is UploadState.EXPORTING:
+            row.set_subtitle("Building the PDF…")
+            row.add_prefix(Adw.Spinner(width_request=16, height_request=16))
+        elif item.state is UploadState.UPLOADING:
+            row.set_subtitle("Uploading…")
+            row.add_prefix(Adw.Spinner(width_request=16, height_request=16))
+        elif item.state is UploadState.CONSUMING:
+            row.set_subtitle("Paperless is consuming…")
+            row.add_prefix(Adw.Spinner(width_request=16, height_request=16))
+        elif item.state is UploadState.DONE:
+            if item.document_id is not None:
+                row.set_subtitle(f"Consumed as document #{item.document_id}")
+            else:
+                row.set_subtitle("Consumed by Paperless")
+            row.add_prefix(Gtk.Image(icon_name="emblem-ok-symbolic"))
+        elif item.state is UploadState.FAILED:
+            row.set_subtitle(item.error or "Upload failed")
+            row.set_subtitle_lines(3)
+            row.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic"))
+            retry = Gtk.Button(
+                icon_name="view-refresh-symbolic",
+                tooltip_text="Retry",
+                valign=Gtk.Align.CENTER,
+                has_frame=False,
+            )
+            retry.connect("clicked", lambda _b, item_id=item.id: self._retry_queue_item(item_id))
+            discard = Gtk.Button(
+                icon_name="window-close-symbolic",
+                tooltip_text="Discard",
+                valign=Gtk.Align.CENTER,
+                has_frame=False,
+            )
+            discard.connect(
+                "clicked", lambda _b, item_id=item.id: self._discard_queue_item(item_id)
+            )
+            row.add_suffix(retry)
+            row.add_suffix(discard)
+        return row
+
+    def _refresh_queue_header(self, items) -> None:
+        if not items:
+            self._queue_button.set_visible(False)
+            return
+        self._queue_button.set_visible(True)
+
+        active = sum(1 for item in items if item.active)
+        failed = sum(1 for item in items if item.state is UploadState.FAILED)
+        self._queue_status_stack.set_visible_child_name("spinner" if active else "icon")
+        self._queue_retry_all_button.set_visible(failed > 0)
+
+        if failed:
+            self._queue_count_label.set_label(str(failed))
+            self._queue_count_label.add_css_class("error")
+            tooltip = f"{failed} failed" if not active else f"{active} uploading, {failed} failed"
+        else:
+            self._queue_count_label.remove_css_class("error")
+            if active:
+                self._queue_count_label.set_label(str(active))
+                tooltip = f"{active} uploading"
+            else:
+                self._queue_count_label.set_label("")
+                tooltip = "Upload queue"
+        self._queue_button.set_tooltip_text(tooltip)
+
+    def _retry_queue_item(self, item_id: int) -> None:
+        self._app.upload_queue.retry(item_id)
+
+    def _discard_queue_item(self, item_id: int) -> None:
+        for item in self._app.upload_queue.items():
+            if item.id == item_id:
+                for page in item.origins:
+                    page.queued = False
+                break
+        self._app.upload_queue.discard(item_id)
+        self._update_actions()
+        self._sync_queue_ui()
+
+    def _retry_all_failed(self) -> None:
+        for item in self._app.upload_queue.items():
+            if item.state is UploadState.FAILED:
+                self._app.upload_queue.retry(item.id)
+
+    def _clear_finished_queue(self) -> None:
+        self._app.upload_queue.clear_finished()
+        self._sync_queue_ui()
 
     # -- misc -------------------------------------------------------------
     def toast(self, message: str) -> None:
@@ -753,8 +1064,71 @@ class SheafWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _on_close(self, *_args) -> bool:
+        if self._force_close:
+            self._teardown()
+            return False
+
         if self._job is not None:
             self._job.cancel()
+
+        counts = self._app.upload_queue.counts()
+        if counts.active:
+            self._confirm_close_with_uploads_pending(counts)
+            return True  # veto for now — the dialog's response decides what happens next
+
+        self._teardown()
+        return False
+
+    def _confirm_close_with_uploads_pending(self, counts) -> None:
+        """Deleting the scan tempdirs out from under an in-flight export would
+        corrupt it, so a close with anything active in the upload queue needs
+        the user's say-so rather than silently discarding work."""
+        queue = self._app.upload_queue
+        unsent = sum(1 for item in queue.items() if item.needs_sources)
+        sent = counts.active - unsent
+
+        parts = []
+        if sent:
+            parts.append(
+                f"{sent} document(s) have already reached Paperless and will be "
+                "filed whether or not you wait."
+            )
+        if unsent:
+            parts.append(f"{unsent} document(s) have not been sent yet and would be lost.")
+
+        dialog = Adw.AlertDialog(
+            heading=f"{counts.active} upload(s) are still in progress",
+            body="\n\n".join(parts),
+        )
+        dialog.add_response("wait", "Wait")
+        dialog.add_response("close", "Close anyway")
+        dialog.set_response_appearance("close", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("wait")
+        dialog.set_close_response("wait")
+        dialog.connect("response", self._on_close_confirmation)
+        dialog.present(self)
+
+    def _on_close_confirmation(self, _dialog, response: str) -> None:
+        if response == "close":
+            self._force_close = True
+            self.close()
+            return
+        # Wait: everything still active finishes (or fails) fast enough that
+        # it may already be done by the time this response arrives — check
+        # now rather than only arming the flag, or a queue that settles
+        # between the dialog opening and the click would never toast.
+        if self._app.upload_queue.counts().active == 0:
+            self.toast("All uploads finished — the window can be closed now")
+            return
+        self._toast_when_queue_empties = True
+
+    def _teardown(self) -> None:
+        # Give anything still mid-export a bounded moment to finish before
+        # its source tempdir is deleted underneath it. A no-op, immediately,
+        # when the queue has nothing active — the common case.
+        self._app.upload_queue.stop()
+        self._app.upload_queue.drain(2.0)
+
         width, height = self.get_default_size()
         self._config.window.width = width
         self._config.window.height = height
@@ -766,16 +1140,21 @@ class SheafWindow(Adw.ApplicationWindow):
             pass
         for tmpdir in self._tmpdirs:
             shutil.rmtree(tmpdir, ignore_errors=True)
-        return False
 
 
 def _default_stem() -> str:
     return f"scan-{datetime.date.today().isoformat()}"
 
 
-def _build_menu():
-    from gi.repository import Gio
+def _queue_item_label(pages: list[Page]) -> str:
+    """A short label for the upload queue popover — not sent to Paperless."""
+    count = len(pages)
+    noun = "page" if count == 1 else "pages"
+    when = datetime.datetime.now().strftime("%H:%M:%S")
+    return f"{count} {noun} — {when}"
 
+
+def _build_menu():
     menu = Gio.Menu()
     menu.append("Reset scanner", "app.reset-scanner")
     menu.append("Paperless settings…", "app.paperless-settings")
