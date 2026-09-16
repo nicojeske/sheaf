@@ -642,6 +642,20 @@ class SheafWindow(Adw.ApplicationWindow):
         holder.set_visible_child_name("loading")
         card.append(holder)
 
+        # Click the thumbnail to toggle this card in or out of the selection.
+        # Not left to GtkFlowBox's own click-to-select gesture: Ctrl+click to
+        # toggle a single card without touching the rest of the selection
+        # does not register reliably in this app's environment (confirmed:
+        # the selection count does not change), so this implements the
+        # toggle directly rather than depending on it. Attached to `holder`
+        # specifically — it has no buttons of its own — so it can never
+        # compete with the rotate/move/delete/preview buttons below.
+        select_gesture = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
+        select_gesture.connect(
+            "pressed", lambda gesture, *_a, p=page: self._on_card_clicked(gesture, p)
+        )
+        holder.add_controller(select_gesture)
+
         label = Gtk.Label(label=page.label)
         label.add_css_class("caption")
         card.append(label)
@@ -760,6 +774,19 @@ class SheafWindow(Adw.ApplicationWindow):
 
     def _preview_page(self, page: Page) -> None:
         PagePreview(page, parent=self, on_crop_changed=self._request_thumbnail).present()
+
+    def _on_card_clicked(self, gesture: Gtk.GestureClick, page: Page) -> None:
+        # Claim the sequence so nothing else (GtkFlowBoxChild's own built-in
+        # click handling included) also tries to act on the same click.
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        card = self._cards.get(id(page))
+        if card is None:
+            return
+        if card.child.is_selected():
+            self._flow.unselect_child(card.child)
+        else:
+            self._flow.select_child(card.child)
+        self._update_actions()
 
     # -- selection and actions -------------------------------------------
     def selected_pages(self) -> list[Page]:

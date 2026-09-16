@@ -188,7 +188,19 @@ real size in millimetres.
 leaves the text unreadably small, so zooming in is the point; 100% means one scan
 pixel per screen pixel.
 
-Selecting nothing means "all pages". Select pages to save or upload a subset.
+Every page from the scan run in progress is selected automatically as it
+arrives, so a freshly scanned receipt is ready to send the moment it
+finishes — no need to click it first. Click a card's thumbnail to toggle it
+into or out of the selection (this is deliberately a plain click rather than
+a modifier — Ctrl+click-to-toggle does not register reliably on every
+system); the rotate/move/delete/preview buttons underneath are unaffected.
+Starting a new scan clears the previous selection rather than adding to it,
+so two receipts scanned back to back stay distinguishable as separate
+documents even before either is sent.
+
+Selecting nothing means "all pages" for **Save as PDF** and **Save as
+images**. For **Send to Paperless** it means "every page not already queued
+or uploaded" instead, so pages already sent are not silently swept up again.
 
 ## Paperless-ngx
 
